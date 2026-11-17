@@ -24,11 +24,24 @@ Model (built from the kit's practice cases, no network, stdlib only):
     if the step is at least 0.25 log) lands on the target's US-midnight
     hour, computed from the target's release date and the US daylight-time
     calendar.  Simultaneous global unlocks are not shifted.
-  * Quantiles are normal around the fitted median, with the per-hour
-    kernel-weighted residual spread, scaled by 0.5: the residual mixture is
-    tight around the median with a few far outliers, so the full normal
-    spread is far too wide on pinball loss (validated on the 4 practice
-    cases: 0.130 vs 0.387 for the house baseline).
+  * Quantiles are normal around the fitted median, with a per-hour spread
+    taken from a leave-one-out (LOO) estimate, scaled by 0.25: for each
+    comparable we predict its curve from all the others and take the
+    standard deviation of those out-of-sample residuals.  The in-sample
+    kernel-weighted residual spread is too narrow — the fit absorbs noise —
+    while the LOO spread is an honest out-of-sample width, wider in the
+    middle hours where the unlock transition and the midday trough make the
+    shape genuinely unpredictable, relatively narrower late.  On the 4
+    practice cases the LOO spread cuts the mean loss from 0.130 to 0.122
+    (every case improves or holds; the 0.25 multiplier is flat-bottomed
+    0.225–0.275 and stable when each case is held out from the tuning).
+    The LOO SD runs ~2x the in-sample kernel SD in the middle hours, so
+    the gain comes from the per-hour shape, not the overall width: the
+    kernel spread at its own optimal 0.5 multiplier is the same width
+    mid-day but too wide late.  The residual mixture is tight around the
+    median with a few far outliers, so the full normal spread is far too
+    wide on pinball loss (validated on the 4 practice cases: 0.130 vs
+    0.387 for the house baseline, and 0.122 with the LOO spread).
   * Fallbacks keep every output valid: if too few clean comparables have a
     complete release day, use all complete ones; if still too few, fall back
     to the persistence forecast (flat at hour 1, spread widening like a
@@ -59,6 +72,10 @@ Z_BY_LEVEL = dict(zip(LEVELS, Z))
 
 BANDWIDTH = 1.5        # Gaussian kernel bandwidth in ln(p1)
 SPREAD_MULT = 0.5      # residual-spread multiplier (pinball-optimal on practice)
+LOO_SPREAD_MULT = 0.25  # multiplier for the LOO out-of-sample spread
+# (the LOO SD runs ~2x the in-sample kernel SD in the middle hours, so its
+# pinball-optimal multiplier is half the kernel one; the gain over the
+# kernel spread comes from the per-hour shape, not the overall width)
 MIN_JUMP_STEP = 0.25   # log step that counts as the US-unlock jump
 HOURS = list(range(2, 25))
 
@@ -146,7 +163,30 @@ def parse_comparable(comp):
         "jump_step": jump_step,
         "simul": is_simultaneous(comp),
         "tier": tier_of(comp),
+        "day": (comp.get("day_start") or "")[:10],
     }
+
+
+def loo_spreads(comps, target_jump_h):
+    """Per-hour out-of-sample spread: leave each comparable out, predict its
+    log-ratio curve from all the others (aligned to its own US-midnight
+    hour), and take the standard deviation of the residuals.  Returns
+    {hour: sd}, or None if there are too few comparables for a stable
+    estimate.  Deterministic: fixed comparable order, no randomness."""
+    if len(comps) < 5:
+        return None
+    out = {}
+    for h in HOURS:
+        resids = []
+        for c in comps:
+            others = [o for o in comps if o is not c]
+            c_day = _dt.datetime.fromisoformat(c["day"]).date()
+            c_jump_h = us_east_midnight_hour(c_day)
+            med_r, _, _, _ = fit_hour(others, h, c["lnp1"], c_jump_h)
+            resids.append(c["ratios"][h] - med_r)
+        mean = sum(resids) / len(resids)
+        out[h] = math.sqrt(sum((r - mean) ** 2 for r in resids) / len(resids))
+    return out
 
 
 def aligned_ratio(comp, h, target_jump_h):
@@ -173,32 +213,46 @@ def weighted_linear(xs, ys, ws):
     return my - b * mx, b
 
 
+def fit_hour(comps, h, lp, target_jump_h):
+    """Local-linear fit for one hour. Returns (med_r, sd, res_pairs, ess)."""
+    xs = [c["lnp1"] for c in comps]
+    ys = [aligned_ratio(c, h, target_jump_h) for c in comps]
+    ws = [math.exp(-0.5 * ((x - lp) / BANDWIDTH) ** 2) for x in xs]
+    a, b = weighted_linear(xs, ys, ws)
+    # Shrink the slope toward 0 when the effective sample is small
+    # (protects extrapolation when the target is bigger than every
+    # comparable), then re-center the intercept at the shrunk slope.
+    ess = sum(ws) ** 2 / sum(w * w for w in ws)
+    shrink = ess / (ess + 3.0)
+    b *= shrink
+    a = sum(w * (y - b * x) for w, x, y in zip(ws, xs, ys)) / sum(ws)
+    med_r = a + b * lp
+    # Clamp the median ratio to the observed range, widened by 10%.
+    lo, hi = min(ys), max(ys)
+    med_r = max(lo - 0.1 * (hi - lo), min(hi + 0.1 * (hi - lo), med_r))
+    res = [y - (a + b * x) for x, y in zip(xs, ys)]
+    sw = sum(ws)
+    sd = math.sqrt(sum(w * r * r for w, r in zip(ws, res)) / sw)
+    return med_r, sd, list(zip(res, ws)), ess
+
+
 def forecast_hours(p1, comps, target_jump_h, zs=Z):
     """Per-hour quantiles from the fitted model, at the given z-values."""
     lp = math.log(p1)
+    loo = loo_spreads(comps, target_jump_h)
     out = []
     for h in HOURS:
-        xs = [c["lnp1"] for c in comps]
-        ys = [aligned_ratio(c, h, target_jump_h) for c in comps]
-        ws = [math.exp(-0.5 * ((x - lp) / BANDWIDTH) ** 2) for x in xs]
-        a, b = weighted_linear(xs, ys, ws)
-        # Shrink the slope toward 0 when the effective sample is small
-        # (protects extrapolation when the target is bigger than every
-        # comparable), then re-center the intercept at the shrunk slope.
-        ess = sum(ws) ** 2 / sum(w * w for w in ws)
-        shrink = ess / (ess + 3.0)
-        b *= shrink
-        a = sum(w * (y - b * x) for w, x, y in zip(ws, xs, ys)) / sum(ws)
-        med_r = a + b * lp
-        # Clamp the median ratio to the observed range, widened by 10%.
-        lo, hi = min(ys), max(ys)
-        med_r = max(lo - 0.1 * (hi - lo), min(hi + 0.1 * (hi - lo), med_r))
-        res = [y - (a + b * x) for x, y in zip(xs, ys)]
-        sw = sum(ws)
-        sd = math.sqrt(sum(w * r * r for w, r in zip(ws, res)) / sw)
+        med_r, sd, _, _ = fit_hour(comps, h, lp, target_jump_h)
+        # Spread: the leave-one-out out-of-sample SD when available
+        # (honest width; the in-sample fit residual is too narrow),
+        # otherwise the in-sample kernel-weighted residual SD.
+        mult = SPREAD_MULT
+        if loo is not None:
+            sd = loo[h]
+            mult = LOO_SPREAD_MULT
         qs = []
         for z in zs:
-            q = math.exp(lp + med_r + z * sd * SPREAD_MULT)
+            q = math.exp(lp + med_r + z * sd * mult)
             qs.append(min(1e9, max(1.0, q)))
         for i in range(1, 5):
             qs[i] = max(qs[i], qs[i - 1])
