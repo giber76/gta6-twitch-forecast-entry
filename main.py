@@ -7,6 +7,11 @@ Model (built from the kit's practice cases, no network, stdlib only):
     text with a "Tier:" tag; early-access-contaminated launches, weak
     analogues (free-to-play / slow-burn) and the GTA VI category's own
     pre-release history are excluded. What remains is the "comparable" tier.
+    The 4 practice cases (Wolverine, RDR2, GoW Ragnarok, Spider-Man 2) are
+    public past launches that are NOT in the kit's comparables list, so
+    they are added here as extra training points (PRACTICE_COMPARABLES);
+    the target itself is always excluded by name, so a prediction never
+    trains on the case it scores.
   * For each comparable we take the release-day log-ratio curve
     r(h) = ln(viewers_h / viewers_1).  The ratio's level depends strongly on
     how big hour 1 already was (corr(ln p1, r_h) ~ -0.9 by the evening):
@@ -32,8 +37,11 @@ Model (built from the kit's practice cases, no network, stdlib only):
     while the LOO spread is an honest out-of-sample width, wider in the
     middle hours where the unlock transition and the midday trough make the
     shape genuinely unpredictable, relatively narrower late.  On the 4
-    practice cases the LOO spread cuts the mean loss from 0.130 to 0.122
-    (every case improves or holds; the 0.25 multiplier is flat-bottomed
+    practice cases the LOO spread cuts the mean loss from 0.130 to 0.122,
+    and adding the 4 practice cases themselves as comparables (leave-one-out)
+    cuts it further to 0.119 (every case holds or improves except RDR2 and
+    Spider-Man 2, which worsen ~0.5% — the twin pair at nearly identical
+    ln p1 pulling each other; the 0.25 multiplier is flat-bottomed
     0.225–0.275 and stable when each case is held out from the tuning).
     The LOO SD runs ~2x the in-sample kernel SD in the middle hours, so
     the gain comes from the per-hour shape, not the overall width: the
@@ -41,7 +49,8 @@ Model (built from the kit's practice cases, no network, stdlib only):
     mid-day but too wide late.  The residual mixture is tight around the
     median with a few far outliers, so the full normal spread is far too
     wide on pinball loss (validated on the 4 practice cases: 0.130 vs
-    0.387 for the house baseline, and 0.122 with the LOO spread).
+    0.387 for the house baseline, 0.122 with the LOO spread, and 0.119
+    with the practice cases added as comparables).
   * Fallbacks keep every output valid: if too few clean comparables have a
     complete release day, use all complete ones; if still too few, fall back
     to the persistence forecast (flat at hour 1, spread widening like a
@@ -78,6 +87,59 @@ LOO_SPREAD_MULT = 0.25  # multiplier for the LOO out-of-sample spread
 # kernel spread comes from the per-hour shape, not the overall width)
 MIN_JUMP_STEP = 0.25   # log step that counts as the US-unlock jump
 HOURS = list(range(2, 25))
+
+# Extra training points: the 4 practice cases are public past launches
+# (hourly Twitch category averages from SullyGnome, the same source the
+# kit's comparables come from), but they are NOT in the kit's comparables
+# list -- so they are added here as extra comparables. Each entry is
+# (release day, hour-1 viewers, viewers for hours 1..24). All four are
+# rolling-midnight launches. When the program scores one of them, that
+# case is excluded by name in forecast_case (leave-one-out): a prediction
+# never trains on the case it scores. At final time (GTA VI) all four
+# are used. Adding them (LOO) cuts the practice mean loss from 0.1218
+# to 0.1190: Wolverine 0.0987 -> 0.0937, RDR2 0.1171 -> 0.1177,
+# GoW Ragnarok 0.0957 -> 0.0879, Spider-Man 2 0.1759 -> 0.1767.
+# The two ~0.5% worsenings (RDR2, Spider-Man 2) are the twin pair at
+# nearly identical ln p1 (11.67 vs 11.69) pulling each other toward the
+# other's shape; the gains (Wolverine -5%, GoW -8%) are an order of
+# magnitude larger, and at final scale (ln p1 14-15) the two models agree
+# within 0.04 log, so the twin effect is irrelevant to the final.
+PRACTICE_COMPARABLES = {
+    "Marvel's Wolverine": ("2026-09-15", [23357,
+        19397, 20292, 18329, 35760, 40523, 38196, 30468, 37322, 32884, 36770,
+        41223, 45078, 58758, 78329, 91382, 133910, 189396, 175604, 206982,
+        212243, 196416, 153926, 147358]),
+    "Red Dead Redemption 2": ("2018-10-26", [116550,
+        102778, 99986, 84459, 152428, 176319, 163532, 148485, 134888, 120686,
+        119921, 138073, 165093, 195646, 231529, 264043, 330969, 369358,
+        322991, 290598, 281596, 258394, 223948, 192584]),
+    "God of War Ragnarök": ("2022-11-09", [269517,
+        220787, 146900, 141669, 156301, 281917, 273454, 258613, 196345, 186781,
+        189204, 152840, 179704, 217655, 271761, 310384, 376075, 435038,
+        444580, 460387, 445097, 434600, 411192, 383725]),
+    "Marvel's Spider-Man 2": ("2023-10-20", [119087,
+        79573, 51615, 50272, 166214, 146818, 125021, 109152, 93203, 83997,
+        71214, 43730, 68551, 100971, 131596, 164722, 176018, 225745, 250538,
+        240849, 258378, 263140, 253088, 216387]),
+}
+
+
+def practice_comparable_records():
+    """Kit-shaped comparable records for the 4 practice cases."""
+    recs = []
+    for name, (day, hours) in PRACTICE_COMPARABLES.items():
+        hourly = [{"from": "%sT%02d:00:00Z" % (day, h - 1),
+                   "viewers": v, "reads": 1}
+                  for h, v in enumerate(hours, start=1)]
+        recs.append({
+            "name": name,
+            "platforms": "",
+            "day_start": day + "T00:00:00Z",
+            "hourly": hourly,
+            "unlock": "Rolling midnight local launch. Tier: comparable",
+            "source": "SullyGnome (practice case, public past launch)",
+        })
+    return recs
 
 
 def round2(x):
@@ -288,6 +350,16 @@ def forecast_case(case, name):
     parsed = []
     for comp in case.get("comparables") or []:
         pc = parse_comparable(comp)
+        if pc is not None:
+            parsed.append(pc)
+    # Extra training points: the 4 practice cases (public past launches,
+    # not in the kit's comparables list). The target itself is excluded
+    # by name -- a prediction never trains on the case it scores.
+    target_name = (case.get("game") or {}).get("name") or ""
+    for rec in practice_comparable_records():
+        if rec["name"] == target_name:
+            continue
+        pc = parse_comparable(rec)
         if pc is not None:
             parsed.append(pc)
     parsed.sort(key=lambda c: c["name"])
