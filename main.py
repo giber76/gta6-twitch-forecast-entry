@@ -51,6 +51,20 @@ Model (built from the kit's practice cases, no network, stdlib only):
     wide on pinball loss (validated on the 4 practice cases: 0.130 vs
     0.387 for the house baseline, 0.122 with the LOO spread, and 0.119
     with the practice cases added as comparables).
+  * v4 (the bias gamble, on Giber's explicit order): every quantile is
+    shifted by a per-hour bias b[h], the MEAN over the 4 practice cases
+    of ln(actual) - ln(v3 median), computed at runtime from the embedded
+    PRACTICE_COMPARABLES by a general procedure (practice_bias) -- never
+    a hard-coded table of fitted numbers. The bias is IN-SAMPLE by
+    construction: each scored practice case contributes its own residual
+    to the bias that corrects it, so the practice grade (~0.097) is the
+    in-sample number, not a validated improvement. Round 9's LOCO
+    transfer test showed this bias does NOT transfer to a new launch
+    (it always hurts RDR2, whose residuals are opposite-signed to
+    Spider-Man 2's), and for a multi-platform final like GTA VI it
+    most likely hurts. The median fit stays leave-one-out; only the
+    bias is in-sample. Giber took this gamble deliberately to chase the
+    practice top 20, knowing the final is a different case.
   * Fallbacks keep every output valid: if too few clean comparables have a
     complete release day, use all complete ones; if still too few, fall back
     to the persistence forecast (flat at hour 1, spread widening like a
@@ -140,6 +154,31 @@ def practice_comparable_records():
             "source": "SullyGnome (practice case, public past launch)",
         })
     return recs
+
+
+def build_comps(case, exclude_practice_name=None):
+    """Parsed comparable set for a forecast: the kit comparables plus the
+    4 practice cases as extra training points, optionally excluding one
+    practice case by name. Sorted by name, filtered to the clean tier
+    (falling back to all when too few are clean). Deterministic: fixed
+    file order, fixed comparable order, no randomness."""
+    parsed = []
+    for comp in case.get("comparables") or []:
+        pc = parse_comparable(comp)
+        if pc is not None:
+            parsed.append(pc)
+    # Extra training points: the 4 practice cases (public past launches,
+    # not in the kit's comparables list). The named one is excluded --
+    # a prediction never trains on the case it scores.
+    for rec in practice_comparable_records():
+        if exclude_practice_name is not None and rec["name"] == exclude_practice_name:
+            continue
+        pc = parse_comparable(rec)
+        if pc is not None:
+            parsed.append(pc)
+    parsed.sort(key=lambda c: c["name"])
+    clean = [c for c in parsed if c["tier"] in (None, "comparable")]
+    return clean if len(clean) >= 5 else parsed
 
 
 def round2(x):
@@ -334,6 +373,40 @@ def persistence_hours(p1, hours):
     return out
 
 
+def practice_bias(case):
+    """Per-hour log-bias of the v3 model on the 4 practice cases.
+
+    For each practice case, forecast it with the v3 model (trained on
+    the kit comparables plus the other 3 practice cases -- the case
+    itself is excluded from its own median fit, exactly as v3 scores
+    it) and take the log-residual of its actual release-day curve
+    against the forecast median: r[c][h] = ln(actual_h) - ln(median_h).
+    The bias b[h] is the MEAN of those residuals over the 4 cases.
+
+    IN-SAMPLE BY CONSTRUCTION (the gamble): the bias mean includes
+    every practice case's own residual, so when the program scores a
+    practice case, that case's own residual is part of the bias that
+    corrects it. The median fit stays leave-one-out (a prediction
+    never trains on the case it scores), but the bias does not. The
+    practice grade of a bias-corrected program is therefore the
+    in-sample number, not a validated improvement -- round 9's LOCO
+    transfer test showed this bias does NOT transfer to a new launch
+    (it always hurts RDR2), and for a multi-platform final like GTA VI
+    it most likely hurts. It is shipped here only as a deliberate
+    gamble on the practice board, on Giber's explicit order.
+    """
+    resid = {h: [] for h in HOURS}
+    for name, (day, hours) in PRACTICE_COMPARABLES.items():
+        comps = build_comps(case, name)
+        jump_h = us_east_midnight_hour(_dt.datetime.fromisoformat(day).date())
+        fc = forecast_hours(hours[0], comps, jump_h)
+        rows = {row["hour"]: row["q"] for row in fc}
+        for h in HOURS:
+            r = math.log(max(1, hours[h - 1])) - math.log(max(1e-9, rows[h][2]))
+            resid[h].append(r)
+    return {h: sum(v) / len(v) for h, v in resid.items()}
+
+
 def forecast_case(case, name):
     levels = case.get("levels") or LEVELS
     zs = [Z_BY_LEVEL.get(lv) for lv in levels]
@@ -347,30 +420,30 @@ def forecast_case(case, name):
     if not hours:
         hours = HOURS
 
-    parsed = []
-    for comp in case.get("comparables") or []:
-        pc = parse_comparable(comp)
-        if pc is not None:
-            parsed.append(pc)
-    # Extra training points: the 4 practice cases (public past launches,
-    # not in the kit's comparables list). The target itself is excluded
-    # by name -- a prediction never trains on the case it scores.
+    # The target itself is excluded by name from the practice cases --
+    # a prediction never trains on the case it scores.
     target_name = (case.get("game") or {}).get("name") or ""
-    for rec in practice_comparable_records():
-        if rec["name"] == target_name:
-            continue
-        pc = parse_comparable(rec)
-        if pc is not None:
-            parsed.append(pc)
-    parsed.sort(key=lambda c: c["name"])
-    clean = [c for c in parsed if c["tier"] in (None, "comparable")]
-    use = clean if len(clean) >= 5 else parsed
+    use = build_comps(case, target_name)
 
     if len(use) >= 3 and set(hours) <= set(HOURS):
         day = _dt.datetime.fromisoformat(
             (case.get("day_start") or "")[:10]).date()
         target_jump_h = us_east_midnight_hour(day)
-        return {"hours": forecast_hours(p1, use, target_jump_h, zs)}
+        fc = forecast_hours(p1, use, target_jump_h, zs)
+        # v4, the bias gamble: shift every quantile by the per-hour
+        # practice bias (see practice_bias). Log-space shift, so
+        # monotonicity and positivity are preserved; re-clamped and
+        # re-rounded exactly as the round-9 experiment did.
+        b = practice_bias(case)
+        out = []
+        for row in fc:
+            h = row["hour"]
+            f = math.exp(b[h])
+            qs = [round2(min(1e9, max(1.0, q * f))) for q in row["q"]]
+            for i in range(1, 5):
+                qs[i] = max(qs[i], qs[i - 1])
+            out.append({"hour": h, "q": qs})
+        return {"hours": out}
     return {"hours": persistence_hours(p1, hours)}
 
 
